@@ -1,0 +1,39 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record Apple toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          python3 --version
+      - name: Test core model with isolated fixtures
+        run: ./scripts/swift-local.sh test --scratch-path .build/ci-tests --filter CirclrCoreTests
+      - name: Test local MCP contracts
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s Tests -p 'test_mcp_*.py'
+      - name: Test standalone MCP server
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 mcp/test_server.py
+      - name: Build and package macOS application
+        run: ./scripts/build-app.sh

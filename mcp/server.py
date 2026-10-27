@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+"""Circlr local MCP adapter. Python standard library only; no GUI or shell execution."""
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+import re
+import socket
+import stat
+import sys
+import uuid
+
+MAX_MESSAGE = 8 * 1024 * 1024
+MAX_ENDPOINT_MANIFEST = 4096
+VERSIONS = {"2025-11-25", "2025-06-18", "2025-03-26"}
+ENDPOINT_BASENAME = re.compile(r"(?:agent\.sock|\.r[0-9a-f]{8})\Z")
+
+
+def schema(properties, required=()):
+    return {"type": "object", "properties": properties, "required": list(required), "additionalProperties": False}
+
+
+STRING = {"type": "string"}
+TAIL_SECONDS = {"type": "number", "minimum": 0, "maximum": 120, "description": "Optional manual release tail in seconds. Omit for automatic estimation (2-second floor, 120-second cap). Independent of UI preferences; job.tail reports estimated/effective duration and notices."}
+REVISION = {"projectID": STRING, "expectedRevision": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}}
+SCOPE = {"arrangementID": STRING, "useID": STRING}
+PORT_ID = {"type": "string", "minLength": 1, "maxLength": 1024}
+PORT_ADDRESS = {"oneOf": [
+    schema({"signal": schema({"_0": PORT_ID}, ["_0"])}, ["signal"]),
+    schema({"composition": schema({"_0": PORT_ID}, ["_0"])}, ["composition"]),
+    schema({"section": schema({"arrangementID": PORT_ID, "useID": PORT_ID}, ["arrangementID", "useID"])}, ["section"]),
+    schema({"music": schema({"arrangementID": PORT_ID, "useID": PORT_ID, "nodeID": PORT_ID}, ["arrangementID", "useID", "nodeID"])}, ["music"]),
+]}
+GROUP_PARENT = {"oneOf": [PORT_ADDRESS["oneOf"][1], PORT_ADDRESS["oneOf"][2],
+    schema({"album": schema({})}, ["album"]), schema({"sound": schema({})}, ["sound"])]}
+GROUP_ADDRESS = schema({"group": schema({"parent": GROUP_PARENT, "id": PORT_ID}, ["parent", "id"])}, ["group"])
+PORT_ADDRESS["oneOf"].append(GROUP_ADDRESS)
+PORT_ENDPOINT = schema({"node": PORT_ADDRESS, "portID": PORT_ID}, ["node", "portID"])
+CONNECTION_ID = schema({"edgeID": PORT_ID, "from": PORT_ADDRESS, "to": PORT_ADDRESS}, ["edgeID", "from", "to"])
+OCTANT = {"type": "integer", "minimum": 0, "maximum": 7, "description": "Clockwise: 0 N, 1 NE, 2 E, 3 SE, 4 S, 5 SW, 6 W, 7 NW. Position only, not a bus."}
+LAYOUT_REVISION = {"expectedLayoutRevision": {"type": "integer", "minimum": 0, "maximum": 9223372036854775806}}
+PORT_PAIR = {**LAYOUT_REVISION, "first": PORT_ENDPOINT, "second": PORT_ENDPOINT, "firstOctant": OCTANT, "secondOctant": OCTANT}
+PLACED_CONNECTION = schema({"id": CONNECTION_ID, "placement": schema({"from": OCTANT, "to": OCTANT}, ["from", "to"])}, ["id", "placement"])
+NOTE = schema({"id": STRING, "beat": {"type": "number", "minimum": 0}, "length": {"type": "number", "exclusiveMinimum": 0}, "pitch": {"type": "integer", "minimum": 0, "maximum": 127}, "velocity": {"type": "integer", "minimum": 1, "maximum": 127}}, ["beat", "length", "pitch", "velocity"])
+AUTOMATION_POINT = schema({"id": STRING, "beat": {"type": "number", "minimum": 0, "maximum": 1048576}, "value": {"type": "number", "minimum": -1, "maximum": 20000}, "shape": {"type": "string", "enum": ["linear", "hold"]}}, ["beat", "value"])
+OPERATION = schema({
+    "kind": {"type": "string", "enum": ["set_global", "rename_project", "set_instrument", "set_track", "add_section", "set_section", "connect_sections", "add_midi", "set_notes", "generate_midi", "set_node", "set_effect", "add_effect", "connect", "reorder_section", "set_clip", "set_step", "edit_notes", "edit_audio", "set_automation"]},
+    "patternID": {"type": "string", "description": "Valid for edit_shared_audio, edit_pitch_bend and edit_sustain; explicit shared rhythm pattern ID, affecting every use. Do not combine with arrangementID/compositionID/nodeID/useID/laneID."},
+    "original": {"type": "boolean", "description": "set_automation: omitted/false edits this use. edit_pitch_bend/edit_sustain normal targets require an explicit boolean. True edits shared section source while retaining existing use overrides."},
+    **SCOPE, "clipID": STRING, "sourceStart": {"type": "number", "minimum": 0}, "duration": {"type": "number", "exclusiveMinimum": 0}, "laneID": STRING, "nodeID": STRING, "trackID": STRING, "name": STRING,
+    "stepIndex": {"type": "integer", "minimum": 0, "description": "Zero-based step in the MIDI circle, not within the visible page."},
+    "subdivisions": {"type": "integer", "enum": [1, 2, 3, 4, 6, 8], "description": "Steps per quarter note; default 4. Does not quantize existing notes."},
+    "pitch": {"type": "integer", "minimum": 0, "maximum": 127},
+    "velocity": {"type": "integer", "minimum": 1, "maximum": 127},
+    "gate": {"type": "number", "minimum": 0.01, "maximum": 16, "description": "Note length in steps. Omit to preserve an existing note; new notes default to 0.9."},
+    "enabled": {"type": "boolean", "description": "Enable a step or bypass/read an existing automation curve, according to kind."},
+    "noteIDs": {"type": "array", "items": STRING, "minItems": 1, "maxItems": 100000},
+    "edit": {"type": "string", "enum": ["transpose", "move", "duplicate", "quantize", "velocity", "length_delta", "velocity_delta", "delete", "split", "fade"]},
+    "parameter": {"type": "string", "enum": ["gain", "pan", "synthCutoff", "synthResonance"], "description": "gain 0–4, pan -1–1, synthCutoff 40–20000 Hz. Cutoff requires a built-in synth instrument node and runtime.capabilities.synthCutoffAutomation=1. synthResonance stores 0–0.9 (display 0–90%), requires synth engine 2/3 and runtime.capabilities.synthResonanceAutomation=1."},
+    "automationPoints": {"type": "array", "items": AUTOMATION_POINT, "maxItems": 4096, "description": "Replace this node parameter curve. Empty clears it. Omitted with enabled changes only bypass."},
+    "sourceOffset": {"type": "number", "exclusiveMinimum": 0, "description": "Split offset in source seconds from the selected clip start."},
+    "fadeIn": {"type": "number", "minimum": 0}, "fadeOut": {"type": "number", "minimum": 0},
+    "velocityOffset": {"type": "integer", "minimum": -126, "maximum": 126, "description": "Signed change for edit_notes velocity_delta; preserves velocity differences. Entire edit fails if any note leaves 1–127."},
+    "semitones": {"type": "integer", "minimum": -127, "maximum": 127},
+    "beatOffset": {"type": "number", "minimum": -131072, "maximum": 131072},
+    "strength": {"type": "number", "minimum": 0, "maximum": 1},
+    "notes": {"type": "array", "items": NOTE, "maxItems": 100000},
+    "pattern": {"type": "string", "enum": ["chords", "arpeggio", "bass", "pulse"]},
+    "append": {"type": "boolean"}, "synthVoice": {"type": "integer", "minimum": 0, "maximum": 9, "description": "0 pad, 1 bass, 2 keys, 3 supersaw, 4 pluck, 5 lead, 6 electricPiano, 7 organ, 8 brass, 9 strings"},
+    "instrument": {"type": "object", "description": "Complete Instrument object from snapshot; use synthVoice for built-in synth presets."},
+    "effect": {"type": "object", "description": "Effect object: kind, amount, secondary, optional plugin. Use inspect to read the existing object."},
+    "context": {"type": "object", "description": "Complete MusicContext object from snapshot, with desired fields changed."},
+    "settings": {"type": "object", "description": "Complete ContextSettings from inspect, with desired inheritance or local values changed."},
+    "gain": {"type": "number", "minimum": 0, "maximum": 4}, "muted": {"type": "boolean"},
+    "startBeat": {"type": "number", "minimum": 0}, "lengthBeats": {"type": "number", "exclusiveMinimum": 0},
+    "repeatCount": {"type": "integer", "minimum": 1, "maximum": 256}, "from": STRING, "to": STRING,
+    "sidechain": {"type": "boolean"}, "bars": {"type": "integer", "minimum": 1, "maximum": 4096},
+}, ["kind"])
+
+ARRANGEMENT_OPERATIONS = ["duplicate_arrangement", "rename_arrangement"]
+OPERATION["properties"]["compositionID"] = {"type": "string", "description": "Explicit owning composition ID; required for arrangement duplication, rename and selection."}
+OPERATION["oneOf"] = [
+    {"type": "object", "properties": {"kind": {"enum": [kind for kind in OPERATION["properties"]["kind"]["enum"] if kind != "set_automation"]}}},
+    {"type": "object", "properties": {"kind": {"enum": ARRANGEMENT_OPERATIONS}},
+     "required": ["compositionID", "arrangementID", "name"]},
+    {"type": "object", "properties": {"kind": {"enum": ["select_arrangement"]}},
+     "required": ["compositionID", "arrangementID"]},
+]
+# Encode parameter ranges in the advertised schema as well as IPC validation.
+AUTOMATION_RANGES = {"gain": (0, 4), "pan": (-1, 1), "synthCutoff": (40, 20000), "synthResonance": (0, 0.9)}
+for parameter, (minimum, maximum) in AUTOMATION_RANGES.items():
+    point = {**AUTOMATION_POINT, "properties": {**AUTOMATION_POINT["properties"],
+             "value": {"type": "number", "minimum": minimum, "maximum": maximum}}}
+    OPERATION["oneOf"].append({"type": "object", "properties": {
+        "kind": {"enum": ["set_automation"]}, "parameter": {"enum": [parameter]},
+        "automationPoints": {"type": "array", "items": point, "maxItems": 4096}},
+        "required": ["parameter"]})
+OPERATION["properties"]["at"] = schema({"x": {"type": "number", "exclusiveMinimum": -10000000, "exclusiveMaximum": 10000000}, "y": {"type": "number", "exclusiveMinimum": -10000000, "exclusiveMaximum": 10000000}}, ["x", "y"])
+OPERATION["oneOf"].append({"type": "object", "properties": {"kind": {"enum": ["insert_section"]}}, "required": ["arrangementID", "useID", "name", "bars", "at"]})
+OPERATION["oneOf"].append({"type": "object", "properties": {"kind": {"enum": ["edit_shared_audio"]},
+    "edit": {"type": "string", "enum": ["split", "duplicate", "fade", "delete"]}},
+    "required": ["patternID", "trackID", "clipID", "edit"]})
+OPERATION["oneOf"].append({"type": "object", "properties": {"kind": {"enum": ["clear_use_tempo_override"]}}, "required": ["arrangementID", "useID"]})
+OPERATION["properties"]["kind"]["enum"].append("clear_use_tempo_override")
+OPERATION["properties"]["kind"]["enum"].extend(ARRANGEMENT_OPERATIONS + ["select_arrangement", "insert_section", "edit_shared_audio"])
+OPERATION["description"] = "clear_use_tempo_override requires arrangementID/useID, removes only that use tempo override, and requires midiTempoImport=1. edit_shared_audio requires patternID, trackID, clipID and edit (split/duplicate/fade/delete). patternID is rejected except on edit_shared_audio/edit_pitch_bend/edit_sustain; arrangementID/compositionID/nodeID/useID/laneID are rejected on edit_shared_audio. original is rejected on kinds other than set_automation/edit_pitch_bend/edit_sustain. It edits the shared rhythm pattern across its uses; split uses sourceOffset seconds, duplicate uses beatOffset, fade uses fadeIn/fadeOut seconds, as in edit_audio. set_automation accepts original: omitted/false edits this use, true edits the shared section source and retains existing use overrides. insert_section requires arrangementID, useID (insert after), name (1–120 trimmed characters), bars (1–4096), and at {x,y}; it atomically inserts a new section into a linear path, preserving editing selection. Branches, loops and non-default transitions fail without changes. duplicate_arrangement and rename_arrangement require explicit compositionID, arrangementID and name (1–120 characters after trimming whitespace). Duplicate shares section sources and assets, preserving every owner's playback choice and the editing canvas. Rename changes only the arrangement name. select_arrangement requires compositionID and arrangementID (no name needed); it deliberately changes the owner's playback choice and visible editing branch."
+
+
+LENGTH_OPERATIONS = ["set_use_length_override", "clear_use_length_override"]
+OPERATION["properties"]["kind"]["enum"].extend(LENGTH_OPERATIONS)
+for kind in LENGTH_OPERATIONS:
+    required = ["kind", "arrangementID", "useID"] + (["bars"] if kind == "set_use_length_override" else [])
+    OPERATION["oneOf"].append(schema({key: ({"enum": [kind]} if key == "kind" else OPERATION["properties"][key]) for key in required}, required))
+OPERATION["description"] += " set_use_length_override requires exactly kind/arrangementID/useID/bars (integer 1–4096); clear_use_length_override requires exactly kind/arrangementID/useID and restores the shared source length. Both require sectionLengthEditing=1. Legacy set_section retains its existing shape and final batch validation. Changes preserve source data and editing selection; unsafe truncation fails atomically."
+
+
+BEND_RANGE = schema({"semitones": {"type": "integer", "minimum": 0, "maximum": 127}, "cents": {"type": "integer", "minimum": 0, "maximum": 127}}, ["semitones", "cents"])
+BEND_CHANGE = schema({"kind": {"type": "string", "enum": ["insert", "update", "remove", "setInitial", "clear"]},
+    "beat": {"type": "number", "minimum": 0, "maximum": 131072}, "rawValue": {"type": "integer", "minimum": 0, "maximum": 16383},
+    "range": BEND_RANGE, "index": {"type": "integer", "minimum": 0, "maximum": 99999}, "channel": {"type": "integer", "minimum": 0, "maximum": 15}}, ["kind"])
+OPERATION["properties"]["change"] = BEND_CHANGE
+OPERATION["properties"]["kind"]["enum"].append("edit_pitch_bend")
+OPERATION["oneOf"].append({"type": "object", "properties": {"kind": {"enum": ["edit_pitch_bend"]}}, "required": ["change"]})
+OPERATION["description"] += " edit_pitch_bend requires midiPitchBendEditing=1 and change. Normal target: arrangementID/useID/laneID/original boolean (explicit); shared target: patternID/trackID only. change: insert uses beat and exactly one rawValue or range; update adds index; remove uses index; setInitial uses channel/rawValue/range; clear has only kind. Indices address current revision; inspect lanes and snapshot patterns expose the stored pitchBend sequence."
+
+
+SUSTAIN_CHANGE = schema({"kind": {"type": "string", "enum": ["insert", "update", "remove", "setInitial", "clear"]},
+    "beat": {"type": "number", "minimum": 0, "maximum": 131072}, "rawValue": {"type": "integer", "minimum": 0, "maximum": 127},
+    "index": {"type": "integer", "minimum": 0, "maximum": 99999}, "channel": {"type": "integer", "minimum": 0, "maximum": 15}}, ["kind"])
+OPERATION["properties"]["sustainChange"] = SUSTAIN_CHANGE
+OPERATION["properties"]["kind"]["enum"].append("edit_sustain")
+OPERATION["oneOf"].append({"type": "object", "properties": {"kind": {"enum": ["edit_sustain"]}}, "required": ["sustainChange"]})
+OPERATION["description"] += " edit_sustain requires fresh midiSustainEditing=1 and sustainChange. Exactly one target: arrangementID/useID/laneID/original boolean (explicit), or shared patternID/trackID. sustainChange: insert uses beat/rawValue; update uses index/beat/rawValue; remove uses index; setInitial uses channel/rawValue; clear has only kind. Raw CC64 values are 0–127, down at 64; indices address the current revision. Inspect lanes and snapshot patterns expose sustain. Clear removes sustain only; pitch bend and notes remain. Shared edits affect every use; normal original=true retains use overrides. All operations in a batch validate before any mutation."
+
+
+def tool(name, method, description, properties=None, required=(), write=False, destructive=None):
+    properties = properties or {}
+    if write:
+        properties = {**REVISION, **properties}
+        required = ("projectID", "expectedRevision", *required)
+    return {"name": "circlr_" + name, "method": method, "description": description,
+            "inputSchema": schema(properties, required),
+            "annotations": {"readOnlyHint": method in {"snapshot", "context", "inspect", "ports", "sounds", "events", "job"}, "destructiveHint": write if destructive is None else destructive, "openWorldHint": False}}
+
+
+TOOLS = [
+    tool("snapshot", "snapshot", "Read current project IDs, revision, tracks, arrangements, selection and active job. Read before every edit."),
+    tool("context", "context", "Read a bounded project summary from the same native snapshot. Includes project/revisions, active arrangement, selection, arrangement/use and track IDs/names, enabled capabilities and short job/playback status. Lists report totals and truncation. Excludes project path, assets, patterns and notes. Use snapshot/inspect for detailed edits; context does not grant write authority."),
+    tool("sounds", "sounds", "Search the actual built-in synth, Sound Bank and installed AU catalog without changing music, focus or playback. Requires snapshot.runtime.capabilities.soundCatalog=1. Read stable IDs and exact synthPatch, raw program/bankLSB/drums or plugin descriptors; names are data. A synth-preset item provides synthPatch: copy it to instrument.synth and set kind=synthesizer when applying; omit the operation synthVoice shortcut so it cannot replace the patch. Reuse catalogID and filters with nextOffset for pagination. Merge returned bank fields into the latest snapshot instrument before set_instrument to preserve inactive patches. Does not audition or certify audio compatibility.", {
+        "soundTarget": {"type": "string", "enum": ["instrument", "effect"], "description": "Default instrument; effect lists AU effects."},
+        "query": {"type": "string", "maxLength": 256, "description": "Name, Korean family, manufacturer or exact display #1–#128. Default empty."},
+        "category": {"type": "string", "enum": ["synth", "soundBank", "instrument", "effect"]},
+        "bankDrums": {"type": "boolean", "description": "Only for instrument target with absent/soundBank category."},
+        "offset": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 128, "description": "Default 64."},
+        "catalogID": {"type": "string", "minLength": 64, "maxLength": 64, "description": "ID returned by the first page; changed catalogs fail with stale_catalog."},
+    }),
+    tool("inspect", "inspect", "Read the effective notes, clips and node graph of one section use.", SCOPE, ("useID",)),
+    tool("ports", "ports", "Read actual IN/OUT descriptors, connections, placements, revision and layoutRevision. Group ports include bindingTarget and all saved bindings; unresolved targets are excluded from active ports. Reuse returned logical connection IDs.", {"node": PORT_ADDRESS}, ("node",)),
+    tool("set_group_port", "set_group_port", "Explicitly expose one real member endpoint on a layout group. Requires node (group address), target and name. Optional existing portID renames the same immutable target. No audio changes; one layout Undo. Duplicate target returns its existing portID.", {**LAYOUT_REVISION, "node": GROUP_ADDRESS, "target": PORT_ENDPOINT, "name": {"type": "string", "minLength": 1, "maxLength": 128}, "portID": PORT_ID}, ("expectedLayoutRevision", "node", "target", "name"), True),
+    tool("remove_group_port", "remove_group_port", "Remove an exposed alias from a group while preserving its internal endpoint and every existing music cable. One layout Undo. Does not automatically route to a replacement port.", {**LAYOUT_REVISION, "node": GROUP_ADDRESS, "portID": PORT_ID}, ("expectedLayoutRevision", "node", "portID"), True),
+    tool("connect_ports", "connect_ports", "Connect explicit compatible endpoints, starting at either IN or OUT. Octants belong to first/second endpoints. One Undo; duplicates are a no-op and do not move existing cables. Requires fresh music and layout revisions.", PORT_PAIR, tuple(PORT_PAIR), True),
+    tool("reconnect_ports", "reconnect_ports", "Replace one existing cable using its complete logical connectionID and two explicit endpoints. Preserves edge ID and gain; rejects cross-graph moves, cycles and duplicates atomically. Composition sequence cables cannot be reconnected.", {**PORT_PAIR, "connectionID": CONNECTION_ID}, (*PORT_PAIR, "connectionID"), True),
+    tool("disconnect_ports", "disconnect_ports", "Disconnect the exact logical cable. One Undo; other section uses stay unchanged. Composition sequence cables cannot be disconnected.", {**LAYOUT_REVISION, "connectionID": CONNECTION_ID}, ("expectedLayoutRevision", "connectionID"), True),
+    tool("move_ports", "move_ports", "Atomically place 1–128 distinct existing cables in eight directions. One layout Undo; changes layoutRevision only, preserving music and audio. Unchanged placements are a no-op.", {**LAYOUT_REVISION, "moves": {"type": "array", "items": PLACED_CONNECTION, "minItems": 1, "maxItems": 128}}, ("expectedLayoutRevision", "moves"), True),
+    tool("apply", "apply", "Atomically apply 1–128 edits as one Undo action. set_automation uses gain 0–4, pan -1–1, or synthCutoff 40–20000 Hz on built-in synth instrument nodes only. Cutoff batches require a fresh matching snapshot with runtime.capabilities.synthCutoffAutomation=1; unsupported apps receive no mutation. synthResonance uses 0–0.9 normalized values (display 0–90%) on built-in synth engine 2/3 instrument nodes only, and requires synthResonanceAutomation=1 from the same fresh snapshot, including clear and bypass edits. Final target and revision validation remain app-side. edit_shared_audio requires patternID, trackID, clipID and edit (split/duplicate/fade/delete), affecting all uses of the shared rhythm pattern; offsets and fades match edit_audio. set_automation original defaults to false (this use); true edits shared section source while retaining use overrides. set_notes/generate_midi replace notes unless append=true. duplicate_arrangement/rename_arrangement require explicit compositionID, arrangementID and a name of 1–120 characters after trimming; duplicate shares section sources/assets while preserving playback choices and the editing canvas. select_arrangement requires compositionID and arrangementID and deliberately changes playback choice and the visible editing branch. Stable IDs are required; stale revisions fail without changes.", {"operations": {"type": "array", "items": OPERATION, "minItems": 1, "maxItems": 128}}, ("operations",), True),
+    tool("import_midi", "import_midi", "Read a local regular SMF format 0/1 file (maximum 16 MiB) in a background job. Requires midiTempoImport=1, midiPitchBendImport=1 and midiSustainImport=1 capabilities and matching project/revision. previewOnly=true returns track IDs, per-track pitchBend eventCount, initialValue/initialRange, rangeChangeCount (all range events), uniqueRangeCount (including initial range), first-seen ranges (at most 16) and hasMoreRanges, optional per-track sustain {eventCount, initialValue, initialIsDown, finalValue, finalIsDown, lastEventBeat}, selectedIssues, actual expressionPolicy, tempo metadata and optional previewIssue without changing the document. expressionPolicy defaults to preserve: supported MIDI pitch bend/RPN sensitivity and sustain CC64 raw values (0–127, pedal down at 64) are retained; CC121=0 resets sustain to off. Selected unsupported expression fails apply. Only explicit omit imports notes without either pitch bend or sustain; issues remain visible. Pitch bend and active sustain audio rendering support built-in synths (sustain engine 1/2/3); unsupported instrument backends reject active pedal expression rather than drop it. Omitted trackIDs imports all note tracks; explicit IDs are index:channel from preview. keepCurrent (default) retains current tempo; applyFile applies the file tempo to this use only and fails on tempoImportIssue. atBeat defaults to 0, extendSection defaults to false. One Undo; preserves editing selection. Read job until terminal. No playback/audition is started.", {
+        **SCOPE, "path": STRING,
+        "trackIDs": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 32}, "minItems": 1, "maxItems": 256},
+        "atBeat": {"type": "number", "minimum": 0, "maximum": 131072},
+        "extendSection": {"type": "boolean"}, "previewOnly": {"type": "boolean"},
+        "tempoPolicy": {"type": "string", "enum": ["keepCurrent", "applyFile"]},
+        "expressionPolicy": {"type": "string", "enum": ["preserve", "omit"]}
+    }, ("path", "arrangementID", "useID"), True),
+    tool("bounce", "bounce", "Start an asynchronous section track bounce including its internal effects and sidechain. Originals remain restorable; audio replaces output inputs. Read job until terminal state.", {**SCOPE, "trackID": STRING, "tailSeconds": TAIL_SECONDS}, ("useID", "trackID"), True),
+    tool("restore_bounce", "restore_bounce", "Restore a bounced circle's original inputs; keep rendered audio as a disconnected archive.", {**SCOPE, "nodeID": STRING}, ("useID", "nodeID"), True),
+    tool("export", "export", "Start asynchronous master WAV export, 48 kHz stereo 24-bit. Requires a NEW absolute .wav path. No file overwrite. Read job for completion and resolved tail/end-window measurements.", {"path": STRING, "tailSeconds": TAIL_SECONDS}, ("path",), True),
+    tool("save", "save", "Save the current project, embedding assets. Optional absolute .circlr path. Cannot overwrite a different project.", {"path": STRING}, (), True),
+    tool("open", "open", "Start asynchronous local .circlr open. Read job to completion, then snapshot for the new project. Rejects unsaved edits. macOS may require the user to allow first file access.", {"path": STRING}, ("path",), True),
+    tool("undo", "undo", "Undo one whole edit. Requires current project ID and revision. Also supply expectedLayoutRevision from ports/snapshot to protect against concurrent layout edits.", LAYOUT_REVISION, write=True),
+    tool("job", "job", "Read one job's running/completed/failed/cancelled state and output path or bounced node ID.", {"jobID": STRING}, ("jobID",)),
+    tool("cancel_job", "cancel_job", "Cancel the active native agent job by jobID without stopping playback, recording or movie capture. Terminal jobs return their existing state; this does not revoke permission for later MCP calls. Requires jobCancellation=1. Use circlr_stop only when the user wants the DAW transport stopped too.", {"projectID": STRING, "jobID": STRING}, ("projectID", "jobID"), destructive=True),
+    tool("events", "events", "Read actual app/agent activity after a sequence cursor. Last 500 events retained. No polling faster than once per second.", {"afterSequence": {"type": "integer", "minimum": 0}}),
+    tool("play", "play", "Prepare and play the album through the Mac audio output."),
+    tool("stop", "stop", "Stop the DAW transport, recording or movie capture and cancel the active render job. For job-only cancellation use circlr_cancel_job."),
+    tool("record", "record", "Start audio recording at the currently selected section/track. Use only when the user requests microphone recording. May require macOS permission. First two input channels (one for mono). Read snapshot.recording until started or failed; circlr_stop cancels or stops and finalizes asynchronously. Do not retry while recording.busy is true.", write=True),
+    tool("playback_loop", "playback_loop", "Choose off/song/section. Requires playbackLoop=1, playbackLoopLive=1 and fresh revision. Stopped or one-shot playback: configure next Play only (no restart); section captures selection at Play. While a loop is playing: capture the current active arrangement and selected use now, render in background without stopping current audio, then schedule replacement at a hardware-acknowledged future boundary. off finishes the current cycle and exit tail before stopping. accepted_pending is acceptance, not completed application: poll snapshot.view.loopTransition until busy=false and verify loopMode. Repeated requests while rendering/scheduled are rejected; Stop cancels. Revision changes during rendering cancel the request; after scheduling they stop output safely. song means active arrangement, not whole album. Linear export PCM is unchanged.", {"loopMode": {"type": "string", "enum": ["off", "song", "section"]}}, ("loopMode",), True),
+    tool("workspace_view", "workspace_view", "Set text-free viewing mode and playback follow without changing musical data. Requires workspaceView=1 and fresh project/revision. follow controls following/off; followSettings selects song/section/pinned, fit/keepZoom, off/subtle/emphasized transition. Pinned requires an explicit stable circle address, never the current selection. Validate and resolve drafts before entering viewing mode; invalid or composing input blocks entry. Follow settings persist in the project workspace. Read snapshot.view for actual settings/state. Native visibility is not certified by this tool.", {
+        "viewingMode": {"type": "boolean"}, "follow": {"type": "boolean"},
+        "followSettings": schema({"target": {"type": "string", "enum": ["song", "section", "pinned"]},
+            "framing": {"type": "string", "enum": ["fit", "keepZoom"]},
+            "transition": {"type": "string", "enum": ["off", "subtle", "emphasized"]},
+            "pinned": {"oneOf": [*PORT_ADDRESS["oneOf"], schema({"album": schema({})}, ["album"]), schema({"sound": schema({})}, ["sound"])]}}, ["target", "framing", "transition"])}, write=True),
+    tool("focus", "focus", "Optionally show a circle, including a group via node address (exclusive of other selectors). Omit targets for the album. With minimized=true/false, only minimize/restore the app window. With follow=true/false alone, resume/disable playback camera follow. Editing and rendering never require focus.", {**SCOPE, "node": PORT_ADDRESS, "compositionID": STRING, "nodeID": STRING, "detail": {"type": "boolean"}, "minimized": {"type": "boolean"}, "follow": {"type": "boolean"}}),
+]
+BY_NAME = {entry["name"]: entry for entry in TOOLS}
+READ_METHODS = frozenset({"snapshot", "context", "inspect", "ports", "sounds", "events", "job"})
+
+CONTEXT_ARRANGEMENT_LIMIT = 16
+CONTEXT_USE_LIMIT = 8
+CONTEXT_TRACK_LIMIT = 32
+CONTEXT_COMPOSITION_LIMIT = 16
+
+
+def _context_string(value, field, maximum=256):
+    if not isinstance(value, str) or len(value) > maximum:
+        raise ValueError(f"Invalid snapshot {field}")
+    return value
+
+
+def _context_object(value, field):
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid snapshot {field}")
+    return value
+
+
+def _context_number(value, field, minimum, maximum):
+    if type(value) not in (int, float) or value < minimum or value > maximum or not math.isfinite(value):
+        raise ValueError(f"Invalid snapshot {field}")
+    return value
+
+
+def _context_items(value, field, limit, project):
+    if not isinstance(value, list):
+        raise ValueError(f"Invalid snapshot {field}")
+    items = [project(item) for item in value[:limit]]
+    return {"total": len(value), "returned": len(items), "truncated": len(value) > len(items), "items": items}
+
+
+def _context_named(item):
+    obj = _context_object(item, "item")
+    return {"id": _context_string(obj.get("id"), "item.id", 128),
+            "name": _context_string(obj.get("name"), "item.name")}
+
+
+def _context_address(value, depth=0):
+    if value is None:
+        return None
+    if depth >= 8 or not isinstance(value, dict) or len(value) != 1:
+        raise ValueError("Invalid snapshot selection")
+    kind, payload = next(iter(value.items()))
+    data = _context_object(payload, "selection address")
+    if kind in ("album", "sound") and not data:
+        return {kind: {}}
+    if kind in ("signal", "composition") and set(data) == {"_0"}:
+        return {kind: {"_0": _context_string(data["_0"], "selection ID", 128)}}
+    keys = {"section": {"arrangementID", "useID"},
+            "music": {"arrangementID", "useID", "nodeID"}}
+    if kind in keys and set(data) == keys[kind]:
+        return {kind: {key: _context_string(data[key], "selection ID", 128) for key in keys[kind]}}
+    if kind == "group" and set(data) == {"parent", "id"}:
+        return {"group": {"parent": _context_address(data["parent"], depth + 1),
+                          "id": _context_string(data["id"], "selection ID", 128)}}
+    raise ValueError("Invalid snapshot selection")
+
+
+def project_context(snapshot):
+    """Allowlist a bounded read-only view of one native snapshot response."""
+    state = _context_object(snapshot, "result")
+    project = {"id": _context_string(state.get("projectID"), "projectID", 128),
+               "name": _context_string(state.get("name"), "name")}
+    for key in ("revision", "layoutRevision"):
+        value = state.get(key)
+        if type(value) is not int or not 0 <= value <= 9223372036854775807:
+            raise ValueError(f"Invalid snapshot {key}")
+        project[key] = value
+    arrangements = state.get("arrangements")
+    tracks = state.get("tracks")
+    if not isinstance(arrangements, list) or not isinstance(tracks, list):
+        raise ValueError("Invalid snapshot music lists")
+    album = state.get("album")
+    compositions = [] if album is None else _context_object(album, "album").get("compositions")
+    if not isinstance(compositions, list):
+        raise ValueError("Invalid snapshot compositions")
+
+    def arrangement_item(item):
+        obj = _context_object(item, "arrangement")
+        return {**_context_named(obj), "uses": _context_items(obj.get("uses"), "uses", CONTEXT_USE_LIMIT, _context_named)}
+
+    def composition_item(item):
+        obj = _context_object(item, "composition")
+        return {**_context_named(obj),
+                "selectedArrangementID": (_context_string(obj["selectedArrangementID"], "selectedArrangementID", 128)
+                                          if obj.get("selectedArrangementID") is not None else None)}
+
+    active_id = _context_string(state.get("activeArrangementID"), "activeArrangementID", 128)
+    active = next((item for item in arrangements if isinstance(item, dict) and item.get("id") == active_id), None)
+    if active is None:
+        raise ValueError("Invalid snapshot active arrangement")
+    owner = next((item for item in compositions if isinstance(item, dict) and
+                  active_id in item.get("arrangementIDs", [])), None)
+    active_summary = {**_context_named(active),
+                      "uses": _context_items(active.get("uses"), "activeArrangement.uses", CONTEXT_USE_LIMIT, _context_named)}
+    if owner is not None:
+        active_summary.update({"compositionID": _context_string(owner.get("id"), "compositionID", 128),
+                               "compositionName": _context_string(owner.get("name"), "compositionName")})
+    else:
+        active_summary.update({"compositionID": None, "compositionName": None})
+
+    address = _context_address(state.get("selection"))
+    selection = {"address": address, "use": None, "composition": None}
+    selected_address = address
+    while isinstance(selected_address, dict) and "group" in selected_address:
+        selected_address = selected_address["group"]["parent"]
+    if isinstance(selected_address, dict):
+        if "composition" in selected_address:
+            selected_id = selected_address["composition"]["_0"]
+            found = next((item for item in compositions if isinstance(item, dict) and item.get("id") == selected_id), None)
+            selection["composition"] = _context_named(found) if found is not None else {"id": selected_id, "name": None}
+        section = selected_address.get("section") or selected_address.get("music")
+        if section is not None:
+            arrangement_id, use_id = section["arrangementID"], section["useID"]
+            source = next((item for item in arrangements if isinstance(item, dict) and item.get("id") == arrangement_id), None)
+            uses = source.get("uses") if source is not None else None
+            found = next((item for item in uses if isinstance(item, dict) and item.get("id") == use_id), None) if isinstance(uses, list) else None
+            selection["use"] = {**(_context_named(found) if found is not None else {"id": use_id, "name": None}),
+                                "arrangementID": arrangement_id}
+
+    runtime = _context_object(state.get("runtime"), "runtime")
+    native_capabilities = _context_object(runtime.get("capabilities"), "capabilities")
+    if len(native_capabilities) > 64:
+        raise ValueError("Invalid snapshot capabilities")
+    capabilities = {}
+    for key, value in native_capabilities.items():
+        key = _context_string(key, "capability", 64)
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError("Invalid snapshot capability value")
+        if value == 1:
+            capabilities[key] = 1
+    playback = _context_object(state.get("playback"), "playback")
+    view = _context_object(state.get("view"), "view")
+    recording = _context_object(state.get("recording"), "recording")
+    output = _context_object(state.get("output"), "output")
+    playing = playback.get("playing")
+    seconds = playback.get("seconds")
+    busy = recording.get("busy")
+    if type(playing) is not bool or type(busy) is not bool:
+        raise ValueError("Invalid snapshot transport")
+    seconds = _context_number(seconds, "playback.seconds", 0, 1e12)
+    job = state.get("job")
+    job_summary = None
+    if job is not None:
+        job = _context_object(job, "job")
+        progress = job.get("progress")
+        progress = _context_number(progress, "job.progress", 0, 1)
+        job_summary = {"id": _context_string(job.get("id"), "job.id", 128),
+                       "kind": _context_string(job.get("kind"), "job.kind", 64),
+                       "state": _context_string(job.get("state"), "job.state", 64),
+                       "progress": progress}
+    return {"project": project,
+            "activeArrangement": active_summary,
+            "selection": selection,
+            "compositions": _context_items(compositions, "compositions", CONTEXT_COMPOSITION_LIMIT, composition_item),
+            "arrangements": _context_items(arrangements, "arrangements", CONTEXT_ARRANGEMENT_LIMIT, arrangement_item),
+            "tracks": _context_items(tracks, "tracks", CONTEXT_TRACK_LIMIT, _context_named),
+            "runtime": {"version": _context_string(runtime.get("version"), "runtime.version", 64),
+                        "build": _context_string(runtime.get("build"), "runtime.build", 64),
+                        "capabilities": capabilities},
+            "status": {"job": job_summary,
+                       "playback": {"playing": playing, "seconds": seconds,
+                                    "loopMode": _context_string(view.get("loopMode"), "loopMode", 32)},
+                       "recording": {"phase": _context_string(recording.get("phase"), "recording.phase", 64),
+                                     "busy": busy},
+                       "output": {"phase": _context_string(output.get("phase"), "output.phase", 64)}}}
+
+
+def validate(value, spec, path="arguments"):
+    if "oneOf" in spec:
+        matches = 0
+        for variant in spec["oneOf"]:
+            try:
+                validate(value, variant, path)
+                matches += 1
+            except ValueError:
+                pass
+        if matches != 1:
+            raise ValueError(f"{path}: expected exactly one supported address shape")
+    kind = spec.get("type")
+    valid = {"object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str),
+             "integer": isinstance(value, int) and not isinstance(value, bool), "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+             "boolean": isinstance(value, bool)}
+    if kind and not valid.get(kind, True):
+        raise ValueError(f"{path}: expected {kind}")
+    if "enum" in spec and value not in spec["enum"]:
+        raise ValueError(f"{path}: invalid value")
+    if kind == "object":
+        for key in spec.get("required", []):
+            if key not in value:
+                raise ValueError(f"{path}.{key}: required")
+        if spec.get("additionalProperties") is False and set(value) - set(spec.get("properties", {})):
+            raise ValueError(f"{path}: unknown fields")
+        for key, item in value.items():
+            if key in spec.get("properties", {}):
+                validate(item, spec["properties"][key], path + "." + key)
+    elif kind == "array":
+        if not spec.get("minItems", 0) <= len(value) <= spec.get("maxItems", MAX_MESSAGE):
+            raise ValueError(f"{path}: item count out of range")
+        for item in value:
+            validate(item, spec.get("items", {}), path + "[]")
+    elif kind == "string":
+        if not spec.get("minLength", 0) <= len(value) <= spec.get("maxLength", MAX_MESSAGE):
+            raise ValueError(f"{path}: string length out of range")
+    elif kind in {"number", "integer"}:
+        if (isinstance(value, float) and not math.isfinite(value)) or value < spec.get("minimum", float("-inf")) or value > spec.get("maximum", float("inf")) or value <= spec.get("exclusiveMinimum", float("-inf")) or value >= spec.get("exclusiveMaximum", float("inf")):
+            raise ValueError(f"{path}: number out of range")
+
+
+def _unique_json_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Invalid endpoint manifest: duplicate field")
+        result[key] = value
+    return result
+
+
+class EndpointResolver:
+    """Resolve the default socket afresh; pin a successful session to one socket."""
+
+    def __init__(self, legacy_socket):
+        self.legacy_socket = str(legacy_socket)
+        self.manifest = Path(self.legacy_socket).parent / "selected.json"
+        self.pinned = None
+        self.pinned_identity = None
+
+    def __str__(self):
+        return self.legacy_socket
+
+    def _manifest_target(self):
+        try:
+            before = os.lstat(self.manifest)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > MAX_ENDPOINT_MANIFEST:
+            raise ValueError("Invalid endpoint manifest: owner, type, mode or size")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(self.manifest, flags)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino) or not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid() or stat.S_IMODE(opened.st_mode) != 0o600 or opened.st_size > MAX_ENDPOINT_MANIFEST:
+                raise ValueError("Invalid endpoint manifest: changed or unsafe file")
+            content = bytearray()
+            while len(content) <= MAX_ENDPOINT_MANIFEST:
+                chunk = os.read(fd, MAX_ENDPOINT_MANIFEST + 1 - len(content))
+                if not chunk:
+                    break
+                content.extend(chunk)
+            if len(content) > MAX_ENDPOINT_MANIFEST:
+                raise ValueError("Invalid endpoint manifest: exceeds 4096 bytes")
+        finally:
+            os.close(fd)
+        try:
+            manifest = json.loads(content.decode("utf-8"), object_pairs_hook=_unique_json_fields)
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("Invalid endpoint manifest: malformed JSON") from error
+        if not isinstance(manifest, dict) or set(manifest) != {"schema", "endpoint", "runID", "bundleID"} or manifest["schema"] != "circlr-agent-endpoint-v1":
+            raise ValueError("Invalid endpoint manifest: unsupported schema")
+        basename, run_id, bundle_id = manifest["endpoint"], manifest["runID"], manifest["bundleID"]
+        if not isinstance(basename, str) or ENDPOINT_BASENAME.fullmatch(basename) is None:
+            raise ValueError("Invalid endpoint manifest: unsafe endpoint")
+        if not isinstance(run_id, str) or len(run_id) != 36:
+            raise ValueError("Invalid endpoint manifest: invalid runID")
+        try:
+            parsed = uuid.UUID(run_id)
+        except ValueError as error:
+            raise ValueError("Invalid endpoint manifest: invalid runID") from error
+        if str(parsed).casefold() != run_id.casefold():
+            raise ValueError("Invalid endpoint manifest: invalid runID")
+        if not isinstance(bundle_id, str) or not bundle_id or len(bundle_id) > 256 or "\0" in bundle_id:
+            raise ValueError("Invalid endpoint manifest: invalid bundleID")
+        return (str(self.manifest.parent / basename), run_id)
+
+    @staticmethod
+    def _socket_identity(path):
+        info = os.lstat(path)
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("Selected endpoint is not a same-user socket")
+        return (info.st_dev, info.st_ino, info.st_uid)
+
+    def resolve(self):
+        try:
+            target = self._manifest_target()
+        except (OSError, ValueError) as error:
+            if self.pinned is not None:
+                raise ValueError("target_changed: restart the MCP session for the new circlr app") from error
+            raise
+        effective_target = target if target is not None else (self.legacy_socket, None)
+        if self.pinned is not None and effective_target != self.pinned:
+            raise ValueError("target_changed: restart the MCP session for the new circlr app")
+        if target is None:
+            path, run_id = self.legacy_socket, None
+        else:
+            path, run_id = target
+        try:
+            identity = self._socket_identity(path)
+        except (OSError, ValueError) as error:
+            if self.pinned is not None:
+                raise ValueError("target_changed: pinned circlr socket is unavailable or replaced") from error
+            raise
+        if self.pinned_identity is not None and identity != self.pinned_identity:
+            raise ValueError("target_changed: pinned circlr socket was replaced")
+        return path, run_id, identity
+
+    def mark_success(self, path, run_id, identity):
+        if self.pinned is None:
+            self.pinned = (path, run_id)
+            self.pinned_identity = identity
+
+
+def rpc(path, request):
+    resolver = path if isinstance(path, EndpointResolver) else None
+    selected_path, run_id, identity = resolver.resolve() if resolver is not None else (path, None, None)
+    if run_id is not None:
+        request = {**request, "expectedRunID": run_id}
+    packet = json.dumps(request, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    if run_id is not None:
+        packet = b"CIRCLR/2 " + run_id.encode("ascii") + b" " + packet
+    if len(packet) > MAX_MESSAGE:
+        raise ValueError("Request exceeds 8 MiB")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(15)
+        client.connect(selected_path)
+        if resolver is not None and resolver._socket_identity(selected_path) != identity:
+            raise ValueError("target_changed: circlr socket was replaced during connection")
+        client.sendall(packet)
+        data = bytearray()
+        while len(data) <= MAX_MESSAGE:
+            chunk = client.recv(65536)
+            if not chunk:
+                raise ConnectionError("Reply interrupted; inspect state before retrying a write with a NEW request ID.")
+            data.extend(chunk)
+            if len(data) > MAX_MESSAGE:
+                raise ValueError("Reply exceeds 8 MiB")
+            if b"\n" in chunk:
+                reply = json.loads(bytes(data).split(b"\n", 1)[0])
+                if resolver is not None:
+                    resolver.mark_success(selected_path, run_id, identity)
+                return reply
+    raise ValueError("Reply exceeds 8 MiB")
+
+
+def validate_operation_scopes(operations):
+    for index, operation in enumerate(operations):
+        kind = operation["kind"]
+        if kind in LENGTH_OPERATIONS:
+            expected = {"kind", "arrangementID", "useID"} | ({"bars"} if kind == "set_use_length_override" else set())
+            if set(operation) != expected:
+                raise ValueError("section length operation has missing or inapplicable fields")
+        if operation.get("parameter") in {"synthCutoff", "synthResonance"} and kind != "set_automation":
+            raise ValueError(f"operations[{index}].parameter: synth automation requires set_automation")
+        if "original" in operation and kind not in {"set_automation", "edit_pitch_bend", "edit_sustain"}:
+            raise ValueError(f"operations[{index}].original: supported only by set_automation/edit_pitch_bend/edit_sustain")
+        if "patternID" in operation and kind not in {"edit_shared_audio", "edit_pitch_bend", "edit_sustain"}:
+            raise ValueError(f"operations[{index}].patternID: supported only by edit_shared_audio/edit_pitch_bend/edit_sustain")
+        if "change" in operation and kind != "edit_pitch_bend":
+            raise ValueError("change requires edit_pitch_bend")
+        if "sustainChange" in operation and kind != "edit_sustain":
+            raise ValueError("sustainChange requires edit_sustain")
+        if kind == "edit_sustain":
+            change = operation["sustainChange"]
+            fields = {"insert": {"kind", "beat", "rawValue"}, "update": {"kind", "beat", "rawValue", "index"},
+                      "remove": {"kind", "index"}, "setInitial": {"kind", "channel", "rawValue"}, "clear": {"kind"}}[change["kind"]]
+            if set(change) != fields:
+                raise ValueError("sustainChange has missing or inapplicable fields")
+            address = {"patternID", "trackID"} if "patternID" in operation else {"arrangementID", "useID", "laneID", "original"}
+            if set(operation) != address | {"kind", "sustainChange"}:
+                raise ValueError("edit_sustain requires exactly one explicit normal or shared target")
+        if kind == "edit_pitch_bend":
+            change = operation["change"]
+            ck = change["kind"]
+            fields = {"insert": {"kind", "beat"}, "update": {"kind", "beat", "index"}, "remove": {"kind", "index"}, "setInitial": {"kind", "channel", "rawValue", "range"}, "clear": {"kind"}}[ck]
+            if ck in {"insert", "update"}:
+                if ("rawValue" in change) == ("range" in change):
+                    raise ValueError("change requires exactly one rawValue or range")
+                fields = fields | ({"rawValue"} if "rawValue" in change else {"range"})
+            if set(change) != fields:
+                raise ValueError("change has missing or inapplicable fields")
+            address = {"arrangementID", "useID", "laneID", "original", "patternID", "trackID", "nodeID", "compositionID", "clipID"}.intersection(operation)
+            expected = {"patternID", "trackID"} if "patternID" in operation else {"arrangementID", "useID", "laneID", "original"}
+            if address != expected:
+                raise ValueError("edit_pitch_bend requires one explicit normal or shared target")
+        if kind == "edit_shared_audio":
+            ambiguous = {"arrangementID", "compositionID", "nodeID", "useID", "laneID"}.intersection(operation)
+            if ambiguous:
+                raise ValueError(f"operations[{index}]: shared audio cannot include {', '.join(sorted(ambiguous))}")
+
+
+def call_tool(path, name, arguments, read_only=False):
+    entry = BY_NAME.get(name)
+    if entry is None:
+        raise ValueError("Unknown tool")
+    if read_only and entry["method"] not in READ_METHODS:
+        raise ValueError("This circlr session is read-only; submit an edit proposal to the coordinator.")
+    validate(arguments, entry["inputSchema"])
+    if entry["method"] == "apply":
+        validate_operation_scopes(arguments["operations"])
+    if entry["method"] == "workspace_view":
+        if not {"viewingMode", "follow", "followSettings"}.intersection(arguments):
+            raise ValueError("workspace_view requires a view setting")
+        settings = arguments.get("followSettings", {})
+        if settings.get("target") == "pinned" and "pinned" not in settings:
+            raise ValueError("pinned follow requires an explicit circle address")
+    if entry["method"] == "import_midi":
+        if not arguments["path"].startswith("/") or "\0" in arguments["path"]:
+            raise ValueError("import_midi.path: absolute local path required")
+        ids = arguments.get("trackIDs")
+        if ids is not None and len(set(ids)) != len(ids):
+            raise ValueError("import_midi.trackIDs: duplicate IDs")
+    request = {"id": str(uuid.uuid4()), "method": "snapshot" if entry["method"] == "context" else entry["method"],
+               "arguments": {k: v for k, v in arguments.items() if k not in REVISION}}
+    for key in REVISION:
+        if key in arguments:
+            request[key] = arguments[key]
+    try:
+        if entry["method"] == "cancel_job":
+            probe = rpc(path, {"id": str(uuid.uuid4()), "method": "snapshot", "arguments": {}})
+            state = probe.get("result") if isinstance(probe, dict) and probe.get("ok") is True else None
+            if not isinstance(state, dict) or state.get("projectID") != request.get("projectID"):
+                raise ValueError("stale_project: read the current snapshot before cancelling a job")
+            runtime = state.get("runtime")
+            capabilities = runtime.get("capabilities") if isinstance(runtime, dict) else None
+            capability = capabilities.get("jobCancellation") if isinstance(capabilities, dict) else None
+            if type(capability) is not int or capability != 1:
+                raise ValueError("This app does not support jobCancellation=1; update the app")
+        required_capabilities = []
+        if entry["method"] == "workspace_view":
+            required_capabilities.append("workspaceView")
+        if entry["method"] == "playback_loop":
+            required_capabilities.extend(["playbackLoop", "playbackLoopLive"])
+        if entry["method"] == "apply" and any(op.get("parameter") == "synthCutoff" for op in arguments["operations"]):
+            required_capabilities.append("synthCutoffAutomation")
+        if entry["method"] == "apply" and any(op.get("parameter") == "synthResonance" for op in arguments["operations"]):
+            required_capabilities.append("synthResonanceAutomation")
+        if entry["method"] == "import_midi" or (entry["method"] == "apply" and any(op["kind"] == "clear_use_tempo_override" for op in arguments["operations"])):
+            required_capabilities.append("midiTempoImport")
+        if entry["method"] == "import_midi":
+            required_capabilities.append("midiPitchBendImport")
+            required_capabilities.append("midiSustainImport")
+        if entry["method"] == "apply" and any(op["kind"] == "edit_pitch_bend" for op in arguments["operations"]):
+            required_capabilities.append("midiPitchBendEditing")
+        if entry["method"] == "apply" and any(op["kind"] == "edit_sustain" for op in arguments["operations"]):
+            required_capabilities.append("midiSustainEditing")
+        if entry["method"] == "apply" and any(op["kind"] in LENGTH_OPERATIONS for op in arguments["operations"]):
+            required_capabilities.append("sectionLengthEditing")
+        if required_capabilities:
+            # This read does not weaken the final app-side revision/atomicity guard.
+            probe = rpc(path, {"id": str(uuid.uuid4()), "method": "snapshot", "arguments": {}})
+            state = probe.get("result") if isinstance(probe, dict) and probe.get("ok") is True else None
+            if not isinstance(state, dict):
+                raise ValueError("Cannot verify app capabilities; read snapshot again")
+            runtime = state.get("runtime", {})
+            capabilities = runtime.get("capabilities", {}) if isinstance(runtime, dict) else {}
+            for required in required_capabilities:
+                capability = capabilities.get(required) if isinstance(capabilities, dict) else None
+                if type(capability) is not int or capability != 1:
+                    raise ValueError(f"This app does not support {required}=1; update the app before editing")
+            if state.get("projectID") != request["projectID"] or type(state.get("revision")) is not int or state.get("revision") != request["expectedRevision"]:
+                raise ValueError("stale_revision: snapshot differs from projectID/expectedRevision")
+        result = rpc(path, request)
+        if entry["method"] == "context":
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                result = {"ok": False, "requestID": request["id"], "error": "snapshot_unavailable"}
+            else:
+                try:
+                    summary = project_context(result.get("result"))
+                except (TypeError, ValueError, OverflowError):
+                    result = {"ok": False, "requestID": request["id"], "error": "invalid_snapshot"}
+                else:
+                    result = {"ok": True, "requestID": request["id"], "result": summary}
+    except (OSError, ValueError) as error:
+        if entry["method"] == "context":
+            message = str(error)
+            result = {"ok": False, "requestID": request["id"],
+                      "error": message if message.startswith("target_changed:") else "snapshot_unavailable"}
+        else:
+            result = {"ok": False, "requestID": request["id"], "error": str(error), "socket": str(path)}
+    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, allow_nan=False)}], "structuredContent": result, "isError": not result.get("ok", False)}
+
+
+def serve(path, read_only=False):
+    initialized = False
+    negotiated = False
+    while True:
+        line = sys.stdin.buffer.readline(MAX_MESSAGE + 1)
+        if not line:
+            return
+        response_id = None
+        try:
+            if len(line) > MAX_MESSAGE:
+                raise ValueError("MCP message exceeds 8 MiB")
+            request = json.loads(line)
+            if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
+                raise ValueError("Expected JSON-RPC 2.0 object")
+            response_id = request.get("id")
+            method = request.get("method")
+            if "id" not in request:
+                if method == "notifications/initialized" and negotiated:
+                    initialized = True
+                continue
+            if method == "initialize":
+                negotiated = True
+                requested = request.get("params", {}).get("protocolVersion")
+                result = {"protocolVersion": requested if requested in VERSIONS else "2025-11-25", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "circlr", "version": "0.80.0"}, "instructions": ("Read-only specialist session. Return edit proposals to the coordinator. " if read_only else "") + "Read snapshot before mutations. Long jobs return immediately; monitor with circlr_job/events and use circlr_cancel_job for job-only cancellation. CUA is unnecessary."}
+            elif method == "ping":
+                result = {}
+            elif not initialized:
+                raise ValueError("Initialize the MCP session first")
+            elif method == "tools/list":
+                result = {"tools": [{k: v for k, v in entry.items() if k != "method"} for entry in TOOLS if not read_only or entry["method"] in READ_METHODS]}
+            elif method == "tools/call":
+                params = request.get("params", {})
+                try:
+                    result = call_tool(path, params.get("name"), params.get("arguments", {}), read_only=read_only)
+                except ValueError as error:
+                    result = {"content": [{"type": "text", "text": str(error)}], "isError": True}
+            else:
+                print(json.dumps({"jsonrpc": "2.0", "id": response_id, "error": {"code": -32601, "message": "Method not found"}}), flush=True)
+                continue
+            response = {"jsonrpc": "2.0", "id": response_id, "result": result}
+        except (ValueError, TypeError, AttributeError) as error:
+            response = {"jsonrpc": "2.0", "id": response_id, "error": {"code": -32600, "message": str(error)}}
+        print(json.dumps(response, ensure_ascii=False, allow_nan=False), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--socket", help="Explicit socket path; uses the legacy JSON wire protocol.")
+    parser.add_argument("--request", help="Send one native JSON request file and exit; omit to run MCP stdio.")
+    parser.add_argument("--read-only", action="store_true", help="Expose and accept only snapshot, context, inspect, ports, sounds, job and events.")
+    args = parser.parse_args()
+    path = args.socket if args.socket is not None else os.environ.get("CIRCLR_SOCKET")
+    if path is None:
+        path = EndpointResolver(Path.home() / "Library/Application Support/circlr/Agent/agent.sock")
+    if args.request:
+        request = json.loads(Path(args.request).read_text())
+        if request.get("method") == "context":
+            parser.error("context is MCP-only; use circlr_context through an MCP client")
+        if args.read_only and request.get("method") not in READ_METHODS:
+            parser.error("This circlr session is read-only")
+        result = rpc(path, request)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        serve(path, read_only=args.read_only)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,267 @@
+import AppKit
+import CoreAudio
+import CoreMIDI
+import XCTest
+import CirclrCore
+@testable import CirclrApp
+
+@MainActor final class MIDIRecordingFidelityTests: XCTestCase {
+    private func makeStore(tempo: Double = 120, repeats: Int = 1) throws -> (AppStore, URL, ID, ID, ID) {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("circlr-midi-fidelity-\(UUID().uuidString)")
+        let store = AppStore(storageRootOverride: root)
+        store.project.global.tempo = tempo
+        let useID = store.project.addSection(name: "MIDI take", at: Point(), bars: 1)
+        let trackID = try XCTUnwrap(store.selectedTrackID)
+        let useIndex = try XCTUnwrap(store.project.active.uses.firstIndex { $0.id == useID })
+        store.project.arrangements[store.project.activeIndex].uses[useIndex].repeatCount = repeats
+        store.selection = [useID]
+        let sectionID = store.project.active.uses[useIndex].sectionID
+        return (store, root, useID, sectionID, trackID)
+    }
+
+    private func send(_ store: AppStore, channel: UInt8, pitch: Int, velocity: Int, on: Bool, at time: Double) {
+        store.midi(status: (on ? 0x90 : 0x80) | channel, pitch: pitch, velocity: velocity, time: time)
+    }
+
+    private func waitForMIDIStop(_ store: AppStore, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while store.midiRecording && ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(store.midiRecording, "MIDI parser drain must complete", file: file, line: line)
+    }
+
+    private func blockMainThread(for seconds: Double) { Thread.sleep(forTimeInterval: seconds) }
+
+    func testStaleOrNonfiniteEventsNeverAuditionOrEnterANewTake() async throws {
+        let (store, root, _, _, _) = try makeStore()
+        defer { store.stop(); try? FileManager.default.removeItem(at: root) }
+        let staleTime = ProcessInfo.processInfo.systemUptime - 1
+        var attacks: [Int] = []
+        store.onMIDIRecordingPreviewCommand = { pitch,_,on in if on { attacks.append(pitch) } }
+        store.startMIDIRecording()
+        store.midi(status: 0x90,pitch: 60,velocity: 100,time: staleTime)
+        store.midi(status: 0x90,pitch: 61,velocity: 100,time: .nan)
+        store.midi(status: 0x90,pitch: 62,velocity: 100,time: .infinity)
+        store.stopRecording()
+        try await waitForMIDIStop(store)
+        XCTAssertTrue(attacks.isEmpty)
+        XCTAssertEqual(store.project.takes?.count ?? 0, 0)
+    }
+
+    func testDifferentChannelsOfSamePitchSurviveInterleavedOffAndTakeUndo() async throws {
+        let (store, root, useID, sectionID, trackID) = try makeStore()
+        defer { store.stop(); try? FileManager.default.removeItem(at: root) }
+        store.startMIDIRecording()
+        XCTAssertTrue(store.midiRecording)
+        let start = ProcessInfo.processInfo.systemUptime
+        send(store, channel: 0, pitch: 60, velocity: 71, on: true, at: start + 0.01)
+        send(store, channel: 1, pitch: 60, velocity: 109, on: true, at: start + 0.04)
+        store.midi(status: 0x90,pitch:60,velocity:0,time:start + 0.08) // MIDI Note On at zero velocity means Note Off.
+        XCTAssertEqual(store.auditionOutput.status.heldNotes, 1, "다른 채널이 유지하는 음을 라이브 미리 듣기에서 끊지 않아야 합니다")
+        send(store, channel: 1, pitch: 60, velocity: 0, on: false, at: start + 0.12)
+        XCTAssertEqual(store.auditionOutput.status.heldNotes, 0)
+        try await Task.sleep(for: .milliseconds(150))
+        store.stopRecording()
+        try await waitForMIDIStop(store)
+
+        let take = try XCTUnwrap(store.project.takes?.last)
+        XCTAssertNil(take.lane.pitchBend,"Note-only captures must not opt into pitch-expression rendering")
+        XCTAssertNil(take.lane.sustain)
+        XCTAssertEqual(take.sourceMIDIChannel,1)
+        XCTAssertEqual(take.useID, useID)
+        XCTAssertEqual(take.lane.trackID, trackID)
+        let notes = (store.project.takes ?? []).flatMap(\.lane.notes).sorted { $0.beat < $1.beat }
+        XCTAssertEqual(notes.count, 2)
+        XCTAssertEqual(notes.map(\.velocity), [71, 109])
+        XCTAssertEqual(notes.map(\.pitch), [60, 60])
+        let first = try XCTUnwrap(notes.first)
+        let second = try XCTUnwrap(notes.dropFirst().first)
+        XCTAssertEqual(second.beat - first.beat, 0.06, accuracy: 0.02)
+        XCTAssertEqual(first.length, 0.14, accuracy: 0.02)
+        XCTAssertEqual(second.length, 0.16, accuracy: 0.02)
+        let active = try XCTUnwrap(store.project.sections.first { $0.id == sectionID })
+        let activeUse = try XCTUnwrap(store.project.active.uses.first { $0.id == useID })
+        XCTAssertEqual(try ArrangementCompiler.effectiveLanes(section: active,use: activeUse).filter { $0.trackID == trackID }.flatMap(\.notes).count, 2)
+        store.undo()
+        XCTAssertEqual(store.project.takes?.count ?? 0, 0)
+        let restoredSection = try XCTUnwrap(store.project.sections.first { $0.id == sectionID })
+        let restoredUse = try XCTUnwrap(store.project.active.uses.first { $0.id == useID })
+        XCTAssertEqual(try ArrangementCompiler.effectiveLanes(section: restoredSection,use: restoredUse).first { $0.trackID == trackID }?.notes.count, 0)
+        XCTAssertEqual(store.project.takes?.count ?? 0, 0)
+    }
+
+    func testSameChannelRetriggerClosesPreviousAtNewOnAndKeepsBothVelocities() async throws {
+        let (store, root, _, _, _) = try makeStore()
+        defer { store.stop(); try? FileManager.default.removeItem(at: root) }
+        store.startMIDIRecording()
+        let start = ProcessInfo.processInfo.systemUptime
+        send(store, channel: 3, pitch: 64, velocity: 65, on: true, at: start + 0.01)
+        send(store, channel: 3, pitch: 64, velocity: 112, on: true, at: start + 0.06)
+        send(store, channel: 3, pitch: 64, velocity: 0, on: false, at: start + 0.11)
+        try await Task.sleep(for: .milliseconds(140))
+        store.stopRecording()
+        try await waitForMIDIStop(store)
+
+        let notes = try XCTUnwrap(store.project.takes?.last?.lane.notes.sorted { $0.beat < $1.beat })
+        XCTAssertEqual(notes.count, 2)
+        XCTAssertEqual(notes.map(\.velocity), [65, 112])
+        let first = try XCTUnwrap(notes.first)
+        let second = try XCTUnwrap(notes.dropFirst().first)
+        XCTAssertEqual(second.beat - first.beat, 0.10, accuracy: 0.02)
+        XCTAssertEqual(first.length, 0.10, accuracy: 0.02)
+        XCTAssertEqual(second.length, 0.10, accuracy: 0.02)
+    }
+
+    func testSecondChannelAttackRearticulatesPreviewButFirstOffKeepsSounding() async throws {
+        let (store, root, _, _, _) = try makeStore()
+        defer { store.stop(); try? FileManager.default.removeItem(at: root) }
+        store.startMIDIRecording()
+        var commands: [String] = []
+        store.onMIDIRecordingPreviewCommand = { pitch,velocity,on in
+            commands.append("\(pitch):\(velocity):\(on ? "on":"off")")
+        }
+        let start = ProcessInfo.processInfo.systemUptime
+        send(store, channel: 0, pitch: 69, velocity: 72, on: true, at: start + 0.01)
+        send(store, channel: 1, pitch: 69, velocity: 111, on: true, at: start + 0.04)
+        XCTAssertEqual(commands, ["69:72:on", "69:111:on"], "두 번째 채널의 Note On도 미리 듣기에 전달해야 합니다")
+        send(store, channel: 0, pitch: 69, velocity: 0, on: false, at: start + 0.08)
+        XCTAssertEqual(commands.count, 2, "첫 채널 Note Off는 아직 소리 내는 두 번째 채널을 끊지 않아야 합니다")
+        send(store, channel: 1, pitch: 69, velocity: 0, on: false, at: start + 0.12)
+        XCTAssertEqual(commands, ["69:72:on", "69:111:on", "69:0:off"])
+        try await Task.sleep(for: .milliseconds(150))
+        store.stopRecording()
+        try await waitForMIDIStop(store)
+    }
+
+    func testStopFlushSplitsHeldNotesAtRepeatBoundaryWithoutDroppingOtherChannel() async throws {
+        let (store, root, _, _, _) = try makeStore(tempo: 999, repeats: 2)
+        defer { store.stop(); try? FileManager.default.removeItem(at: root) }
+        let clock = try XCTUnwrap(store.recordingClock)
+        XCTAssertGreaterThan(clock.seconds, 0.23)
+        XCTAssertLessThan(clock.seconds, 0.25)
+        store.startMIDIRecording()
+        let start = ProcessInfo.processInfo.systemUptime
+        send(store, channel: 0, pitch: 67, velocity: 75, on: true, at: start + 0.18)
+        send(store, channel: 1, pitch: 67, velocity: 103, on: true, at: start + 0.20)
+        send(store, channel: 0, pitch: 67, velocity: 0, on: false, at: start + 0.27)
+        try await Task.sleep(for: .milliseconds(320))
+        store.stopRecording()
+        try await waitForMIDIStop(store)
+        XCTAssertEqual(store.auditionOutput.status.heldNotes, 0)
+
+        let takes = try XCTUnwrap(store.project.takes)
+        XCTAssertEqual(takes.count, 4)
+        let first = [takes[0],takes[2]].flatMap(\.lane.notes)
+        let second = [takes[1],takes[3]].flatMap(\.lane.notes)
+        XCTAssertEqual(first.map(\.velocity).sorted(), [75, 103])
+        XCTAssertEqual(second.map(\.velocity).sorted(), [75, 103])
+        XCTAssertTrue(first.allSatisfy { $0.beat + $0.length <= clock.beats + 0.000001 })
+        XCTAssertTrue(second.allSatisfy { $0.beat >= 0 && $0.beat < clock.beats })
+
+    }
+
+    func testDelayedStopRejectsEventsPastRepeatLimitAndClampsHeldNotesToLastBoundary() async throws {
+        let (store, root, _, _, _) = try makeStore(tempo: 999, repeats: 2)
+        defer { store.stop(); try? FileManager.default.removeItem(at: root) }
+        let clock = try XCTUnwrap(store.recordingClock)
+        let limit = clock.seconds * 2
+        store.startMIDIRecording()
+        var commands: [String] = []
+        store.onMIDIRecordingPreviewCommand = { pitch, _, on in
+            commands.append("\(pitch):\(on ? "on" : "off")")
+        }
+        let sampledNow = ProcessInfo.processInfo.systemUptime
+        let start = sampledNow - store.midiRecordingElapsedSeconds
+        send(store, channel: 0, pitch: 60, velocity: 80, on: true, at: start + 0.18)
+
+        // A blocked main run loop can deliver both MIDI callbacks and the 30 Hz timer
+        // after the selected repeats end. Their source timestamps still identify a
+        // short final-boundary note and a later attack that must never enter a take.
+        blockMainThread(for: limit + 0.12)
+        send(store, channel: 1, pitch: 63, velocity: 93, on: true, at: start + limit - 0.001)
+        send(store, channel: 2, pitch: 65, velocity: 105, on: true, at: start + limit + 0.02)
+        send(store, channel: 1, pitch: 63, velocity: 0, on: false, at: start + limit + 0.05)
+        store.stopRecording()
+        try await waitForMIDIStop(store)
+
+        XCTAssertFalse(store.midiRecording)
+        XCTAssertEqual(store.auditionOutput.status.heldNotes, 0)
+        XCTAssertFalse(commands.contains("65:on"), "선택한 반복 밖의 새 attack은 preview도 시작하지 않아야 합니다")
+        XCTAssertTrue(commands.contains("60:off"), "마지막 note가 stop 시점까지 눌려 있어도 audition을 해제해야 합니다")
+        XCTAssertTrue(commands.contains("63:off"), "늦게 전달된 Note Off도 audition을 해제해야 합니다")
+        let takes = try XCTUnwrap(store.project.takes)
+        XCTAssertEqual(takes.count, 4, "두 채널 × 두 반복이며 세 번째 반복은 없어야 합니다")
+        XCTAssertEqual(takes.flatMap(\.lane.notes).filter { $0.pitch == 65 }.count, 0)
+        let finalNotes = [takes[1],takes[3]].flatMap(\.lane.notes)
+        XCTAssertEqual(Set(finalNotes.map(\.pitch)), [60, 63])
+        XCTAssertTrue(finalNotes.allSatisfy { $0.beat >= 0 && $0.beat + $0.length <= clock.beats + 0.000001 })
+        XCTAssertEqual(try XCTUnwrap(finalNotes.first { $0.pitch == 60 }).beat + XCTUnwrap(finalNotes.first { $0.pitch == 60 }).length,
+                       clock.beats, accuracy: 0.000001)
+        let edgeNote = try XCTUnwrap(finalNotes.first { $0.pitch == 63 })
+        XCTAssertLessThan(edgeNote.length, 0.03125, "최소 note 길이가 선택한 마지막 반복의 경계를 넘겨서는 안 됩니다")
+        XCTAssertEqual(edgeNote.beat + edgeNote.length,
+                       clock.beats, accuracy: 0.000001)
+        store.undo() // atomic capture and activation
+        XCTAssertEqual(store.project.takes?.count ?? 0, 0)
+    }
+
+    func testVirtualMIDIPacketsAlreadyReceivedBeforeAutomaticStopStayInTakeAndSurviveSave() throws {
+        let oldDestinations = Set((0..<MIDIGetNumberOfDestinations()).map { MIDIGetDestination($0) })
+        let (store, root, _, _, _) = try makeStore(tempo: 600)
+        defer { store.stop(); try? FileManager.default.removeItem(at: root) }
+        var lateAttacks: [Int] = []
+        store.onMIDIRecordingPreviewCommand = { pitch,_,on in if on { lateAttacks.append(pitch) } }
+        let destination = try XCTUnwrap((0..<MIDIGetNumberOfDestinations()).map { MIDIGetDestination($0) }
+            .first { !oldDestinations.contains($0) }, "AppStore의 새 가상 MIDI destination")
+        var client = MIDIClientRef(), port = MIDIPortRef()
+        XCTAssertEqual(MIDIClientCreate("circlr take timing sender" as CFString, nil, nil, &client), noErr)
+        defer { if port != 0 { MIDIPortDispose(port) }; if client != 0 { MIDIClientDispose(client) } }
+        XCTAssertEqual(MIDIOutputPortCreate(client, "take timing output" as CFString, &port), noErr)
+        let group = DispatchGroup(), sender = DispatchQueue(label: "circlr.test.midi-timing-sender")
+        let lock = NSLock()
+        var sendStatuses: [OSStatus] = []
+        let send: (UInt8) -> Void = { status in
+            let raw = UnsafeMutableRawPointer.allocate(byteCount: 1024, alignment: 8)
+            defer { raw.deallocate() }
+            let list = raw.bindMemory(to: MIDIPacketList.self, capacity: 1)
+            let packet = MIDIPacketListInit(list)
+            let bytes: [UInt8] = [status, 60, status == 0x90 ? 100 : 0]
+            let timestamp = AudioGetCurrentHostTime()
+            bytes.withUnsafeBufferPointer { _ = MIDIPacketListAdd(list, 1024, packet, timestamp, 3, $0.baseAddress!) }
+            let result = MIDISend(port, destination, list)
+            lock.lock(); sendStatuses.append(result); lock.unlock()
+        }
+        store.startMIDIRecording()
+        XCTAssertTrue(store.midiRecording)
+        group.enter()
+        sender.asyncAfter(deadline: .now() + .milliseconds(60)) { send(0x90); group.leave() }
+        group.enter()
+        sender.asyncAfter(deadline: .now() + .milliseconds(140)) { send(0x80); group.leave() }
+        // Keep MainActor occupied past the 0.4s section boundary. CoreMIDI and
+        // the parser queue can receive both packets, but their UI delivery waits.
+        Thread.sleep(forTimeInterval: 0.55)
+        XCTAssertEqual(group.wait(timeout: .now() + 1), .success)
+        lock.lock(); let statuses = sendStatuses; lock.unlock()
+        XCTAssertEqual(statuses, [noErr, noErr])
+        store.tick()
+        XCTAssertTrue(store.midiRecording, "자동 종료는 먼저 parser→MainActor 입력을 비워야 합니다")
+        let deadline = Date().addingTimeInterval(2)
+        while store.midiRecording && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        XCTAssertFalse(store.midiRecording)
+        XCTAssertTrue(lateAttacks.isEmpty, "정지를 누른 뒤 backlog의 Note On을 새로 울리면 안 됩니다")
+        let note = try XCTUnwrap(store.project.takes?.last?.lane.notes.first)
+        XCTAssertEqual(store.project.takes?.last?.lane.notes.count, 1)
+        XCTAssertGreaterThan(note.beat, 0.2)
+        XCTAssertLessThan(note.beat, 2)
+        XCTAssertGreaterThan(note.length, 0.3)
+        store.undo() // atomic capture and activation
+        XCTAssertEqual(store.project.takes?.count ?? 0, 0)
+        store.redo()
+        let document = root.appendingPathComponent("timed-take.circlr")
+        _ = try ProjectStore.save(store.project, to: document, mediaRoot: nil)
+        let reopened = try ProjectStore.load(document)
+        XCTAssertEqual(try XCTUnwrap(reopened.project.takes?.last?.lane.notes.first?.beat), note.beat, accuracy: 0.001)
+    }
+}
