@@ -25,7 +25,7 @@
 
 ## 소스 빌드
 
-**macOS 14+, active developer directory로 선택한 full Xcode 26+, Python 3**가 필요합니다. 선택 사항인 agent-kit 설치에는 **Python 3.11+**가 필요합니다. 기존 native 검증 플랫폼은 Apple Silicon입니다.
+**macOS 14+, active developer directory로 선택한 full Xcode 26+, Python 3**가 필요합니다. 선택 사항인 agent-kit 설치에는 **Python 3.11+**가 필요합니다. 기존 native 검증 플랫폼은 Apple Silicon입니다. 이번 로컬 공개 사본 검사는 Xcode 27.1 / Swift 6.4에서 실행했습니다. CI는 macOS 26과 Xcode 26.6을 선택하도록 구성했으며 수정 후 결과는 [검증 기록](docs/validation.md)에서 별도로 다룹니다.
 
 ```sh
 ./scripts/build-app.sh

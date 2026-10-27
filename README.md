@@ -25,7 +25,7 @@ Both screenshots are unmodified native captures of build253. [Capture details](d
 
 ## Build from source
 
-Use **macOS 14+, full Xcode 26+ selected as the active developer directory, and Python 3**. The optional agent-kit installer requires **Python 3.11+**. Apple Silicon is the previously validated native platform.
+Use **macOS 14+, full Xcode 26+ selected as the active developer directory, and Python 3**. The optional agent-kit installer requires **Python 3.11+**. Apple Silicon is the previously validated native platform. The local publication checks used Xcode 27.1 / Swift 6.4. CI is configured for macOS 26 with Xcode 26.6; its updated result is tracked separately in [validation](docs/validation.md).
 
 ```sh
 ./scripts/build-app.sh

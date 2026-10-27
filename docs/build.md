@@ -4,6 +4,14 @@
 
 필수 환경은 macOS 14+, full Xcode 26+와 Python 3입니다. `xcode-select`로 선택한 developer directory에서 `xcrun actool`, `sips`, `iconutil`, Swift를 사용할 수 있어야 합니다. agent-kit installer는 Python 3.11+의 `tomllib`를 사용합니다.
 
+## CI toolchain
+
+CI는 `macos-26` ARM runner에서 `DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer`를 명시합니다. 로컬 공개 사본 검사는 Xcode 27.1 / Swift 6.4에서 실행했으며 두 환경의 결과를 합산하지 않습니다.
+
+최초 `macos-15` runner는 기본 Xcode 16.4 / Swift 6.1.2를 사용해 Core 컴파일에 실패했습니다. 문서의 Xcode 26+ 요구보다 낮은 toolchain을 선택한 CI 구성 오류를 수정한 것으로, 수정된 CI의 성공을 뜻하지 않습니다. [검증 기록](validation.md)
+
+CI now explicitly selects macOS 26 ARM / Xcode 26.6. The first CI used the macOS 15 default Xcode 16.4 / Swift 6.1.2 and failed during Core compilation. Local passing checks used Xcode 27.1 / Swift 6.4. The corrected CI result remains a separate gate.
+
 ## Core와 MCP
 
 ```sh

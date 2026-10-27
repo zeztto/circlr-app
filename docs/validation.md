@@ -2,7 +2,9 @@
 
 공개 source 사본에서2026-10-27에 직접 실행한 검사입니다. 앱 source는 **1.2.0/build 253**이며 새 제품 release를 선언하지 않습니다.
 
-## 직접 실행한 검사 · Checks performed
+## 로컬 직접 실행 · Local checks
+
+아래 결과는 Xcode 27.1 / Swift 6.4의 로컬 공개 사본에서 얻었습니다. CI 수정 작업으로 전체 검사나 build를 다시 실행하지 않았습니다.
 
 | 검사 | 결과 | 범위 |
 | --- | --- | --- |
@@ -21,6 +23,14 @@ Core 736은 한 번 실행한 결과이며 서로 다른 집중 검사를 합산
 `Package.swift`, `Sources`와 `Tests`의 542파일은 기준 source와 byte 동일합니다. build가 재생성한 아이콘 catalog는 별도 생성물이며 실행권한·문서·공개 구성과 구별해 대조했습니다. demo는 manifest 관리 payload 26개와 manifest 자체를 그대로 보존했습니다.
 
 빌드 성공과 별개로 Swift 6.4 compiler에서 기존 concurrency·capture·deprecated syntax 경고가 발생했습니다. 이 공개 구성 작업에서는 기능 source를 수정하지 않았으며 warning-free build로 기록하지 않습니다.
+
+## CI 기록 · CI status
+
+최초 native CI는 `macos-15` ARM runner의 기본 **Xcode 16.4 / Swift 6.1.2**에서 Core 컴파일에 실패했습니다. Core step은 exit 1이며 뒤의 MCP·server·package build step은 skipped였습니다. 이를 로컬 PASS와 합산하거나 CI 통과로 표시하지 않습니다.
+
+문서의 Xcode 26+ 조건보다 낮은 환경이 선택돼 runner 구성을 `macos-26`과 명시적인 **Xcode 26.6** developer directory로 수정했습니다. **수정된 CI 결과는 아직 이 문서에서 PASS로 확인하지 않았습니다.** 기능 source·Tests는 그대로 유지했습니다.
+
+The first CI failed Core compilation with Xcode 16.4 / Swift 6.1.2; later steps were skipped. CI now targets macOS 26 ARM / Xcode 26.6. Its corrected run has not been recorded as passing here. Local Xcode 27.1 / Swift 6.4 results remain separate.
 
 ## 화면과 실제 실행의 범위 · Runtime boundary
 

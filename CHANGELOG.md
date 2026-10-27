@@ -6,6 +6,7 @@
 - 개인 설정·음악 작업 폴더·원시 QA 기록과 과거 Git history를 제외했습니다.
 - 데모와 기존 권리 고지를 유지하고 공개 문서·이미지 출처를 정리했습니다.
 - source 공개 구성 변경이며 새 제품 버전·release를 선언하지 않습니다.
+- 최초 CI의 macOS 15 기본 Xcode 16.4 컴파일 실패를 기록하고 macOS 26 / Xcode 26.6을 명시하도록 구성했습니다. 로컬 검증 환경은 Xcode 27.1 / Swift 6.4이며 수정된 CI의 성공을 아직 기록하지 않았습니다.
 
 Application code remains 1.2.0/build 253. This publication snapshot removes private configuration/work artifacts and preserves demo notices. It does not declare a new product release.
 
