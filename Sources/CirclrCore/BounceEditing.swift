@@ -1,0 +1,69 @@
+import Foundation
+
+public struct BounceSource: Codable, Equatable {
+    public var outputNodeID:ID
+    public var replacedInputs:[MusicConnection]
+    public var sourceRevision:Int
+    public var bodySeconds:Double
+    public var tailSeconds:Double
+    public var familyID:ID?
+}
+public struct BounceTarget:Equatable {
+    public let outputNodeID:ID
+    public let inputs:[MusicConnection]
+}
+public enum BounceEditing {
+    /// Shared UI, agent and apply preflight; no render job or project mutation.
+    public static func target(trackID:ID,useID:ID,arrangementID:ID?=nil,in project:Project)throws->BounceTarget {
+        let graph=try targetGraph(trackID:trackID,useID:useID,arrangementID:arrangementID,in:project)
+        return try target(trackID:trackID,graph:graph)
+    }
+    static func targetGraph(trackID:ID,useID:ID,arrangementID:ID?,in project:Project)throws->SectionGraph {
+        guard project.tracks.contains(where:{$0.id==trackID}) else{throw BounceIssue.missingTrack}
+        guard let use=project.arrangements.first(where:{$0.id==(arrangementID ?? project.activeArrangementID)})?.uses.first(where:{$0.id==useID}),
+              let section=project.sections.first(where:{$0.id==use.sectionID}),
+              let graph=try SectionGraphEditing.effective(section:section,use:use) else{throw BounceIssue.missingSection}
+        return graph
+    }
+    static func target(trackID:ID,graph:SectionGraph)throws->BounceTarget {
+        let outputs=graph.nodes.filter{if case .output(let id)=$0.content{return id==trackID};return false}
+        guard !outputs.isEmpty else{throw BounceIssue.noOutput}
+        guard outputs.count==1,let output=outputs.first else{throw BounceIssue.multipleOutputs}
+        let inputs=graph.edges.filter{$0.to==output.id}
+        guard !inputs.isEmpty else{throw BounceIssue.noInputs}
+        return BounceTarget(outputNodeID:output.id,inputs:inputs)
+    }
+
+    /// Captures a track's section output before track gain and global routing.
+    /// Disconnects its former inputs without destroying their nodes or note data.
+    @discardableResult public static func apply(asset:Asset,trackID:ID,useID:ID,bodySeconds:Double,tailSeconds:Double,in project:inout Project) throws -> ID {
+        var candidate=project
+        guard let use=candidate.active.uses.first(where:{$0.id==useID}),let section=candidate.sections.first(where:{$0.id==use.sectionID}),var graph=try SectionGraphEditing.effective(section:section,use:use) else {throw CirclrError("바운스할 섹션을 찾을 수 없습니다")}
+        let target=try target(trackID:trackID,useID:useID,in:candidate)
+        let inputs=target.inputs,outputID=target.outputNodeID
+        var lane=Lane(trackID:trackID),clip=AudioClip(assetID:asset.id,duration:asset.duration)
+        clip.preservesTail=true;lane.audio=[clip]
+        var node=MusicCircle(name:"\(asset.name)",content:.audio(laneID:lane.id,clipID:clip.id))
+        node.bounce=BounceSource(outputNodeID:outputID,replacedInputs:inputs,sourceRevision:project.musicRevision,bodySeconds:bodySeconds,tailSeconds:tailSeconds)
+        candidate.assets.append(asset)
+        // Lane edit can introduce automatic routes; finish with our exact graph below.
+        try ProjectEditing.setLane(lane,for:useID,original:false,in:&candidate)
+        graph.edges.removeAll{$0.to==outputID}
+        graph.nodes.append(node);graph.edges.append(MusicConnection(from:node.id,to:outputID,signal:.audio))
+        let position=graph.layout.positions[outputID] ?? Point();graph.layout.positions[node.id]=Point(position.x-240,position.y-220)
+        try SectionGraphEditing.set(graph,useID:useID,original:false,in:&candidate)
+        try ProjectStore.validateStructure(candidate);project=candidate;return node.id
+    }
+    public static func restore(nodeID:ID,useID:ID,in project:inout Project) throws {
+        var candidate=project
+        guard let use=candidate.active.uses.first(where:{$0.id==useID}),let section=candidate.sections.first(where:{$0.id==use.sectionID}),var graph=try SectionGraphEditing.effective(section:section,use:use),let node=graph.nodes.first(where:{$0.id==nodeID}),let source=node.bounce else {throw CirclrError("바운스 원본을 찾을 수 없습니다")}
+        let family=Set(graph.nodes.filter{n in n.id==nodeID || (source.familyID != nil && n.bounce?.familyID==source.familyID && n.bounce?.outputNodeID==source.outputNodeID && n.bounce?.replacedInputs==source.replacedInputs)}.map(\.id))
+        guard source.replacedInputs.allSatisfy({edge in graph.nodes.contains{$0.id==edge.from} && graph.nodes.contains{$0.id==edge.to}}),graph.edges.filter({$0.to==source.outputNodeID}).allSatisfy({family.contains($0.from)}) else {throw CirclrError("바운스 이후 출력 연결이 변경되었습니다. 연결을 정리하거나 Undo로 복원하세요")}
+        graph.edges.removeAll{$0.to==source.outputNodeID}
+        graph.edges.append(contentsOf:source.replacedInputs)
+        // Keep the rendered audio circle as a disconnected, reusable archive.
+        for i in graph.nodes.indices where family.contains(graph.nodes[i].id) {graph.nodes[i].muted=true;graph.nodes[i].bounce=nil}
+        try SectionGraphEditing.set(graph,useID:useID,original:false,in:&candidate)
+        try ProjectStore.validateStructure(candidate);project=candidate
+    }
+}
